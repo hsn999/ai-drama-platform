@@ -1,0 +1,180 @@
+# AI 短剧平台 — Docker Compose
+# 用法见 doc/Docker-Compose部署指南.md
+#
+# 仅应用（Mock 模式，无需 GPU）:
+#   docker compose --profile app up -d --build
+#
+# 完整栈（含 GPU 的 Ollama + ComfyUI）:
+#   docker compose --profile app --profile gpu up -d --build
+#
+# 含 PostgreSQL + Celery（V1.1+）:
+#   docker compose --profile app --profile gpu --profile full up -d --build
+
+name: ai-drama-platform
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-production}
+  APP_HOST: 0.0.0.0
+  APP_PORT: 8000
+  SECRET_KEY: ${SECRET_KEY:-change-me-to-random-string}
+  DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////app/storage/ai_drama.db}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  OLLAMA_BASE_URL: http://ollama:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+  COMFYUI_BASE_URL: http://comfyui:8188
+  FFMPEG_PATH: ffmpeg
+  FFPROBE_PATH: ffprobe
+  STORAGE_ROOT: /app/storage
+  DEFAULT_SHOT_DURATION: ${DEFAULT_SHOT_DURATION:-5}
+  DEFAULT_FPS: ${DEFAULT_FPS:-24}
+  DEFAULT_RESOLUTION: ${DEFAULT_RESOLUTION:-768x1344}
+  DEFAULT_OUTPUT_RESOLUTION: ${DEFAULT_OUTPUT_RESOLUTION:-1080x1920}
+  CHARACTER_VARIANT_COUNT: ${CHARACTER_VARIANT_COUNT:-4}
+  MVP_SHOT_COUNT: ${MVP_SHOT_COUNT:-3}
+  HARDWARE_PROFILE_ID: ${HARDWARE_PROFILE_ID:-rtx5060ti_16g}
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+services:
+  postgres:
+    profiles: [full]
+    image: postgres:16-alpine
+    container_name: drama-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-drama}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-drama123}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_drama}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - drama_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-drama} -d ${POSTGRES_DB:-ai_drama}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    profiles: [app, full]
+    image: redis:7-alpine
+    container_name: drama-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  ollama:
+    profiles: [gpu]
+    image: ollama/ollama:latest
+    container_name: drama-ollama
+    restart: unless-stopped
+    <<: *gpu
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  comfyui:
+    profiles: [gpu]
+    build:
+      context: .
+      dockerfile: docker/comfyui/Dockerfile
+    container_name: drama-comfyui
+    restart: unless-stopped
+    <<: *gpu
+    shm_size: "8gb"
+    ports:
+      - "${COMFYUI_PORT:-8188}:8188"
+    volumes:
+      - ${COMFYUI_MODELS_DIR:-./data/comfyui/models}:/app/ComfyUI/models
+      - ${COMFYUI_CUSTOM_NODES_DIR:-./data/comfyui/custom_nodes}:/app/ComfyUI/custom_nodes
+      - ${COMFYUI_INPUT_DIR:-./data/comfyui/input}:/app/ComfyUI/input
+      - comfyui_output:/app/ComfyUI/output
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8188/system_stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  backend:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: drama-backend
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    volumes:
+      - ${STORAGE_DIR:-./storage}:/app/storage
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    container_name: drama-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      - backend
+
+  celery-worker:
+    profiles: [full]
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: drama-celery-worker
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "queue.celery_app",
+        "worker",
+        "-l",
+        "info",
+        "-Q",
+        "story,prompt,character,video,editor",
+      ]
+    environment:
+      <<: *backend-env
+    volumes:
+      - ${STORAGE_DIR:-./storage}:/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+volumes:
+  drama_pg_data:
+  ollama_data:
+  comfyui_output:
