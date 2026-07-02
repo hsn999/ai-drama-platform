@@ -32,6 +32,11 @@ class Settings(BaseSettings):
 
     comfyui_base_url: str = "http://127.0.0.1:8188"
     comfyui_timeout: float = 300.0
+    comfyui_output_dir: Path | None = None
+    flux_unet: str = "flux1-dev-fp8.safetensors"
+    flux_clip_l: str = "clip_l.safetensors"
+    flux_clip_t5: str = "t5xxl_fp8_e4m3fn.safetensors"
+    flux_vae: str = "ae.safetensors"
 
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"

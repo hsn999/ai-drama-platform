@@ -61,17 +61,30 @@ async function startGenerate() {
 
 async function pollProgress() {
   const timer = setInterval(async () => {
-    const t = await projectApi.progress(projectId)
-    if (t.status === 'completed') {
-      clearInterval(timer)
-      generating.value = false
-      progress.value = { step: 'done', percent: 100, message: '生成完成' }
-      await load()
-      ElMessage.success('视频生成完成')
-    } else if (t.status === 'failed') {
-      clearInterval(timer)
-      generating.value = false
-      ElMessage.error(t.result?.error || '生成失败')
+    try {
+      const t = await projectApi.progress(projectId)
+      if (t.status === 'running' || t.status === 'pending') {
+        progress.value = {
+          step: t.status,
+          percent: t.progress ?? 0,
+          message: t.status === 'running'
+            ? `生成中… ${t.progress ?? 0}%`
+            : '任务排队中…',
+        }
+      }
+      if (t.status === 'completed') {
+        clearInterval(timer)
+        generating.value = false
+        progress.value = { step: 'done', percent: 100, message: '生成完成' }
+        await load()
+        ElMessage.success('视频生成完成')
+      } else if (t.status === 'failed') {
+        clearInterval(timer)
+        generating.value = false
+        ElMessage.error(t.result?.error || '生成失败')
+      }
+    } catch {
+      /* 忽略单次轮询失败 */
     }
   }, 2000)
 }

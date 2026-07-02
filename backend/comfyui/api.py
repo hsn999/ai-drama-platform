@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
-from config import get_settings
+from config import ROOT_DIR, get_settings
 
 settings = get_settings()
 WORKFLOW_DIR = Path(__file__).parent / "workflows"
@@ -37,7 +37,7 @@ class ComfyUIClient:
             resp.raise_for_status()
             return resp.json()["prompt_id"]
 
-    async def wait_for_completion(self, prompt_id: str, poll_interval: float = 2.0) -> list[str]:
+    async def wait_for_completion(self, prompt_id: str, poll_interval: float = 2.0) -> list[dict[str, str]]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             while True:
                 resp = await client.get(f"{self.base_url}/history/{prompt_id}")
@@ -45,12 +45,43 @@ class ComfyUIClient:
                 history = resp.json()
                 if prompt_id in history:
                     outputs = history[prompt_id].get("outputs", {})
-                    files: list[str] = []
+                    files: list[dict[str, str]] = []
                     for node_output in outputs.values():
                         for img in node_output.get("images", []):
-                            files.append(img["filename"])
+                            files.append(
+                                {
+                                    "filename": img["filename"],
+                                    "subfolder": img.get("subfolder", ""),
+                                    "type": img.get("type", "output"),
+                                }
+                            )
                     return files
                 await asyncio.sleep(poll_interval)
+
+    async def download_image(self, filename: str, subfolder: str = "", type_: str = "output") -> bytes:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/view",
+                params={"filename": filename, "subfolder": subfolder, "type": type_},
+            )
+            resp.raise_for_status()
+            return resp.content
+
+    def _resolve_output_file(self, filename: str) -> Path | None:
+        candidates: list[Path] = []
+        if settings.comfyui_output_dir:
+            candidates.append(settings.comfyui_output_dir / filename)
+        candidates.extend(
+            [
+                Path("/hy-tmp/ComfyUI/output") / filename,
+                Path("ComfyUI/output") / filename,
+                ROOT_DIR.parent / "ComfyUI" / "output" / filename,
+            ]
+        )
+        for path in candidates:
+            if path.is_file():
+                return path
+        return None
 
     def load_workflow(self, name: str) -> dict:
         path = WORKFLOW_DIR / name
@@ -69,17 +100,31 @@ class ComfyUIClient:
         sampler_steps: int = 20,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
-        if await self.is_available() and self.load_workflow("character_portrait_flux.json"):
+        if await self.is_available():
             try:
-                workflow = self._build_simple_txt2img(prompt, width, height, checkpoint, sampler_steps)
+                if "flux" in checkpoint.lower():
+                    workflow = self._build_flux_txt2img(prompt, width, height, sampler_steps)
+                else:
+                    workflow = self._build_simple_txt2img(
+                        prompt, width, height, checkpoint, sampler_steps
+                    )
                 prompt_id = await self.queue_prompt(workflow)
-                files = await self.wait_for_completion(prompt_id)
-                if files:
-                    src = Path("ComfyUI/output") / files[0]
-                    if src.exists():
-                        dst = output_dir / f"{prefix}_{uuid.uuid4().hex[:8]}.png"
-                        dst.write_bytes(src.read_bytes())
+                images = await self.wait_for_completion(prompt_id)
+                if images:
+                    img = images[0]
+                    dst = output_dir / f"{prefix}_{uuid.uuid4().hex[:8]}.png"
+                    try:
+                        dst.write_bytes(
+                            await self.download_image(
+                                img["filename"], img.get("subfolder", ""), img.get("type", "output")
+                            )
+                        )
                         return dst
+                    except Exception:
+                        src = self._resolve_output_file(img["filename"])
+                        if src:
+                            dst.write_bytes(src.read_bytes())
+                            return dst
             except Exception:
                 pass
         return self._create_placeholder_image(output_dir, prefix, prompt, width, height)
@@ -95,6 +140,7 @@ class ComfyUIClient:
         height: int = 1344,
         checkpoint: str = "flux1-dev.safetensors",
         sampler_steps: int = 20,
+        motion: str = "zoom_in",
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
         if await self.is_available():
@@ -108,10 +154,86 @@ class ComfyUIClient:
                     checkpoint=checkpoint,
                     sampler_steps=sampler_steps,
                 )
-                return await self._images_to_video([keyframe], output_dir, prefix, duration, fps)
+                return await self._image_to_kenburns_clip(
+                    keyframe, output_dir, prefix, duration, fps, motion, width, height
+                )
             except Exception:
                 pass
-        return self._create_placeholder_video(output_dir, prefix, prompt, duration, fps)
+        return await self._create_placeholder_video(
+            output_dir, prefix, prompt, duration, fps, motion, width, height
+        )
+
+    def _flux_negative(self, prompt: str) -> str:
+        base = "blurry, low quality, text, watermark"
+        pl = prompt.lower()
+        if any(k in pl for k in ("dog", "puppy", "cat", "animal only", "no human", "no people")):
+            base += ", human, person, man, woman, boy, girl, portrait, face"
+        return base
+
+    def _build_flux_txt2img(
+        self,
+        prompt: str,
+        width: int,
+        height: int,
+        sampler_steps: int = 20,
+    ) -> dict:
+        """Flux 分拆加载：UNet + DualCLIP + VAE（适配魔搭 FP8 等非合并权重）."""
+        return {
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": uuid.uuid4().int % (2**32),
+                    "steps": sampler_steps,
+                    "cfg": 1.0,
+                    "sampler_name": "euler",
+                    "scheduler": "simple",
+                    "denoise": 1,
+                    "model": ["4", 0],
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "latent_image": ["5", 0],
+                },
+            },
+            "4": {
+                "class_type": "UNETLoader",
+                "inputs": {
+                    "unet_name": settings.flux_unet,
+                    "weight_dtype": "default",
+                },
+            },
+            "5": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": width, "height": height, "batch_size": 1},
+            },
+            "10": {
+                "class_type": "DualCLIPLoader",
+                "inputs": {
+                    "clip_name1": settings.flux_clip_l,
+                    "clip_name2": settings.flux_clip_t5,
+                    "type": "flux",
+                },
+            },
+            "11": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": settings.flux_vae},
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": prompt, "clip": ["10", 0]},
+            },
+            "7": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": self._flux_negative(prompt), "clip": ["10", 0]},
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["3", 0], "vae": ["11", 0]},
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "drama", "images": ["8", 0]},
+            },
+        }
 
     def _build_simple_txt2img(
         self,
@@ -121,15 +243,18 @@ class ComfyUIClient:
         checkpoint: str = "flux1-dev.safetensors",
         sampler_steps: int = 20,
     ) -> dict:
+        is_flux = "flux" in checkpoint.lower()
+        cfg = 3.5 if is_flux else 7.5
+        sampler = "euler" if is_flux else "euler"
         return {
             "3": {
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": uuid.uuid4().int % (2**32),
                     "steps": sampler_steps,
-                    "cfg": 7.5,
-                    "sampler_name": "euler",
-                    "scheduler": "normal",
+                    "cfg": cfg,
+                    "sampler_name": sampler,
+                    "scheduler": "simple" if is_flux else "normal",
                     "denoise": 1,
                     "model": ["4", 0],
                     "positive": ["6", 0],
@@ -144,6 +269,30 @@ class ComfyUIClient:
             "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
             "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "drama", "images": ["8", 0]}},
         }
+
+    async def _image_to_kenburns_clip(
+        self,
+        image: Path,
+        output_dir: Path,
+        prefix: str,
+        duration: int,
+        fps: int,
+        motion: str,
+        width: int,
+        height: int,
+    ) -> Path:
+        from video.ffmpeg import image_to_kenburns_clip
+
+        out = output_dir / f"{prefix}_{uuid.uuid4().hex[:8]}.mp4"
+        await image_to_kenburns_clip(
+            str(image),
+            str(out),
+            float(duration),
+            resolution=f"{width}x{height}",
+            fps=fps,
+            motion=motion,
+        )
+        return out
 
     async def _images_to_video(
         self, images: list[Path], output_dir: Path, prefix: str, duration: int, fps: int
@@ -165,41 +314,21 @@ class ComfyUIClient:
         img.save(path)
         return path
 
-    def _create_placeholder_video(
-        self, output_dir: Path, prefix: str, prompt: str, duration: int, fps: int
+    async def _create_placeholder_video(
+        self,
+        output_dir: Path,
+        prefix: str,
+        prompt: str,
+        duration: int,
+        fps: int,
+        motion: str = "zoom_in",
+        width: int = 768,
+        height: int = 1344,
     ) -> Path:
-        frame = self._create_placeholder_image(output_dir, f"{prefix}_frame", prompt, 768, 1344)
-        out = output_dir / f"{prefix}_{uuid.uuid4().hex[:8]}.mp4"
-        from video.ffmpeg import images_to_video
-
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # sync fallback
-            import subprocess
-
-            cmd = [
-                settings.ffmpeg_path,
-                "-y",
-                "-loop",
-                "1",
-                "-i",
-                str(frame),
-                "-c:v",
-                "libx264",
-                "-t",
-                str(duration),
-                "-pix_fmt",
-                "yuv420p",
-                "-r",
-                str(fps),
-                str(out),
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
-        else:
-            loop.run_until_complete(images_to_video([str(frame)], str(out), duration, fps))
-        return out
+        frame = self._create_placeholder_image(output_dir, f"{prefix}_frame", prompt, width, height)
+        return await self._image_to_kenburns_clip(
+            frame, output_dir, prefix, duration, fps, motion, width, height
+        )
 
 
 comfyui_client = ComfyUIClient()

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from agents.character_designer_agent import design_character_prompt
 from agents.director_agent import optimize_prompt
 from agents.prompt_agent import generate_shot_prompt
-from agents.storyboard_agent import create_storyboard
+from agents.storyboard_agent import _fallback_shots, create_storyboard
+from agents.subject_context import motion_from_camera
 from agents.writer_agent import parse_story
 from comfyui.api import comfyui_client
 from config import get_settings
@@ -18,8 +21,27 @@ from models.entities import Project, Scene, Shot, Task
 from video.ffmpeg import concat_videos
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str, int, int, str], Awaitable[None]]
+
+
+def _scene_payload(scene: Scene) -> dict:
+    return {
+        "scene": scene.scene_index,
+        "description": scene.description,
+        "emotion": scene.emotion,
+        "environment": scene.environment,
+    }
+
+
+async def _load_project(db: AsyncSession, project_id: str) -> Project | None:
+    result = await db.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .options(selectinload(Project.scenes).selectinload(Scene.shots))
+    )
+    return result.scalar_one_or_none()
 
 
 async def run_generation_pipeline(
@@ -40,11 +62,12 @@ async def run_generation_pipeline(
         if task:
             task.progress = int(current / total * 100) if total else 0
             await db.flush()
+            await db.commit()
         if on_progress:
             await on_progress(step, current, total, message)
 
     task = await db.get(Task, task_id)
-    project = await db.get(Project, project_id)
+    project = await _load_project(db, project_id)
     if not task or not project:
         return
 
@@ -52,13 +75,19 @@ async def run_generation_pipeline(
         task.status = "running"
         project.status = "parsing"
         await db.flush()
+        await db.commit()
 
         await progress("story_parse", 0, 5, f"Parsing story ({profile.name})...")
-        parsed = await parse_story(project.story, ollama_model=llm_model)
+        story_context = (project.story or "").strip()
+        parsed = await parse_story(story_context, ollama_model=llm_model)
         scenes_data = parsed.get("scenes", [])
 
-        for old_scene in list(project.scenes):
-            await db.delete(old_scene)
+        await db.execute(
+            delete(Shot).where(
+                Shot.scene_id.in_(select(Scene.id).where(Scene.project_id == project.id))
+            )
+        )
+        await db.execute(delete(Scene).where(Scene.project_id == project.id))
         await db.flush()
 
         scenes: List[Scene] = []
@@ -77,10 +106,18 @@ async def run_generation_pipeline(
         await progress("storyboard", 1, 5, "Creating storyboard...")
         project.status = "storyboarding"
         shots_data = await create_storyboard(
-            [s.__dict__ for s in scenes] if scenes else [{"description": project.story}],
+            [_scene_payload(s) for s in scenes] if scenes else [{"description": story_context}],
             shot_count=shot_count,
+            story_context=story_context,
             ollama_model=llm_model,
         )
+        if not shots_data:
+            logger.warning("Storyboard returned no shots, using fallback for project %s", project.id)
+            shots_data = _fallback_shots(
+                [_scene_payload(s) for s in scenes] if scenes else [{"description": story_context}],
+                shot_count,
+                story_context,
+            )
 
         if not scenes:
             scene = Scene(project_id=project.id, scene_index=1, description=project.story)
@@ -89,8 +126,8 @@ async def run_generation_pipeline(
             scenes = [scene]
 
         scene = scenes[0]
-        for old_shot in list(scene.shots):
-            await db.delete(old_shot)
+        await db.flush()
+        await db.execute(delete(Shot).where(Shot.scene_id == scene.id))
         await db.flush()
 
         shots: List[Shot] = []
@@ -110,8 +147,12 @@ async def run_generation_pipeline(
         project.status = "generating"
         for shot in shots:
             raw = shot.metadata_.get("raw", {})
-            prompt = await generate_shot_prompt(raw, project.style, ollama_model=llm_model)
-            shot.prompt = await optimize_prompt(prompt, ollama_model=llm_model)
+            prompt = await generate_shot_prompt(
+                raw, project.style, story_context=story_context, ollama_model=llm_model
+            )
+            shot.prompt = await optimize_prompt(
+                prompt, story_context=story_context, ollama_model=llm_model
+            )
         await db.flush()
 
         video_paths: List[str] = []
@@ -131,11 +172,21 @@ async def run_generation_pipeline(
                 height=profile.height,
                 checkpoint=profile.comfyui_checkpoint,
                 sampler_steps=profile.sampler_steps,
+                motion=motion_from_camera(shot.camera_motion),
             )
+            if not video_path.is_file():
+                raise RuntimeError(f"Video file not created for shot {shot.shot_index}: {video_path}")
             shot.video_url = f"/api/media/shot/{video_path.name}"
             shot.status = "completed"
             video_paths.append(str(video_path))
             await db.flush()
+
+        video_paths = [p for p in video_paths if Path(p).is_file()]
+        if not video_paths:
+            raise RuntimeError(
+                f"No shot videos generated (expected {len(shots)}). "
+                "Check ComfyUI and ffmpeg are running."
+            )
 
         await progress("video_merge", total, total, "Merging videos...")
         project.status = "editing"
@@ -159,10 +210,14 @@ async def run_generation_pipeline(
         await progress("completed", total, total, "Done")
 
     except Exception as exc:
-        project.status = "failed"
-        task.status = "failed"
-        task.result = {"error": str(exc)}
-        await db.flush()
+        await db.rollback()
+        task = await db.get(Task, task_id)
+        project = await db.get(Project, project_id)
+        if task and project:
+            project.status = "failed"
+            task.status = "failed"
+            task.result = {"error": str(exc)}
+            await db.commit()
         raise
 
 

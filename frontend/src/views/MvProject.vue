@@ -71,7 +71,7 @@ onMounted(load)
                 placeholder="如：雨夜霓虹、校园青春、赛博都市…"
               />
             </el-form-item>
-            <el-button type="primary" @click="saveTheme">保存主题</el-form-item>
+            <el-button type="primary" @click="saveTheme">保存主题</el-button>
           </el-form>
         </el-card>
       </el-col>

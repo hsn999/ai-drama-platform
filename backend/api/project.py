@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import traceback
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -29,6 +31,7 @@ from hardware_profiles import get_profile
 from services.pipeline import run_generation_pipeline
 
 router = APIRouter(prefix="/project", tags=["project"])
+logger = logging.getLogger(__name__)
 
 
 async def _get_project_detail(db: AsyncSession, project_id: str) -> Project:
@@ -113,17 +116,30 @@ async def _run_pipeline_bg(
         async def on_progress(step: str, current: int, total: int, message: str) -> None:
             await broadcast_progress(project_id, step, current, total, message)
 
-        await run_generation_pipeline(
-            db, project_id, task_id, shot_count, hardware_profile_id, on_progress
-        )
-        await db.commit()
+        try:
+            await run_generation_pipeline(
+                db, project_id, task_id, shot_count, hardware_profile_id, on_progress
+            )
+            await db.commit()
+        except Exception as exc:
+            logger.error("Pipeline failed for project %s: %s", project_id, exc)
+            traceback.print_exc()
+            await db.rollback()
+            async with AsyncSessionLocal() as err_db:
+                task = await err_db.get(Task, task_id)
+                if task:
+                    task.status = "failed"
+                    task.result = {"error": str(exc)}
+                    project = await err_db.get(Project, project_id)
+                    if project:
+                        project.status = "failed"
+                    await err_db.commit()
 
 
 @router.post("/{project_id}/generate", response_model=GenerateResponse)
 async def generate_project(
     project_id: str,
     body: GenerateRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     project = await db.get(Project, project_id)
@@ -138,6 +154,7 @@ async def generate_project(
     )
     db.add(task)
     await db.flush()
+    await db.refresh(task)
 
     shot_count = body.shot_count
     profile = get_profile(body.hardware_profile_id)
@@ -145,9 +162,11 @@ async def generate_project(
         shot_count = profile.default_shot_count
     shot_count = min(shot_count, profile.max_shot_count)
 
-    background_tasks.add_task(
-        _run_pipeline_bg, project_id, task.id, shot_count, body.hardware_profile_id
-    )
+    task_id = task.id
+    hardware_profile_id = body.hardware_profile_id
+    await db.commit()
+
+    asyncio.create_task(_run_pipeline_bg(project_id, task_id, shot_count, hardware_profile_id))
 
     return GenerateResponse(
         task_id=task.id,
